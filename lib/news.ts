@@ -1,6 +1,4 @@
-import { promises as fs } from "fs";
-import path from "path";
-import { randomUUID } from "crypto";
+import { supabase, getSupabaseAdmin } from "./supabase";
 import {
   NEWS_CATEGORIES,
   type NewsCategory,
@@ -15,94 +13,142 @@ export {
   type NewsInput,
 };
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const NEWS_FILE = path.join(DATA_DIR, "news.json");
+const TABLE = "news";
 
-async function readAll(): Promise<NewsItem[]> {
-  try {
-    const raw = await fs.readFile(NEWS_FILE, "utf-8");
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as NewsItem[]) : [];
-  } catch (err: unknown) {
-    // ファイルが無い場合は空配列で初期化
-    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
-      await fs.mkdir(DATA_DIR, { recursive: true });
-      await fs.writeFile(NEWS_FILE, "[]", "utf-8");
-      return [];
-    }
-    throw err;
-  }
+// Supabase の行（snake_case）を NewsItem（camelCase）へ変換
+type NewsRow = {
+  id: string;
+  title: string;
+  category: string;
+  body: string;
+  published_at: string;
+  is_published: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+function rowToItem(row: NewsRow): NewsItem {
+  return {
+    id: row.id,
+    title: row.title,
+    category: row.category as NewsCategory,
+    body: row.body,
+    // date 型は "YYYY-MM-DD" 文字列で返る
+    publishedAt: row.published_at,
+    isPublished: row.is_published,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
-async function writeAll(items: NewsItem[]): Promise<void> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(NEWS_FILE, JSON.stringify(items, null, 2), "utf-8");
+function inputToRow(input: NewsInput) {
+  return {
+    title: input.title,
+    category: input.category,
+    body: input.body,
+    published_at: input.publishedAt,
+    is_published: input.isPublished,
+  };
 }
 
-function sortByPublishedDesc(items: NewsItem[]): NewsItem[] {
-  return [...items].sort((a, b) => {
-    if (a.publishedAt === b.publishedAt) {
-      return b.createdAt.localeCompare(a.createdAt);
-    }
-    return b.publishedAt.localeCompare(a.publishedAt);
-  });
-}
+// 掲載日の降順、同日なら作成日時の降順
+const ORDER = "published_at.desc,created_at.desc";
 
 /** 管理画面用: すべてのお知らせ（下書き含む）を新しい順で取得 */
 export async function getAllNews(): Promise<NewsItem[]> {
-  return sortByPublishedDesc(await readAll());
+  // 下書きも含めるため RLS をバイパスする admin クライアントを使用
+  const client = getSupabaseAdmin() ?? supabase;
+  if (!client) return [];
+  const { data, error } = await client
+    .from(TABLE)
+    .select("*")
+    .order("published_at", { ascending: false })
+    .order("created_at", { ascending: false });
+  if (error || !data) return [];
+  return (data as NewsRow[]).map(rowToItem);
 }
 
 /** 公開側用: 公開中のお知らせのみを新しい順で取得 */
 export async function getPublishedNews(limit?: number): Promise<NewsItem[]> {
-  const published = sortByPublishedDesc(
-    (await readAll()).filter((n) => n.isPublished),
-  );
-  return typeof limit === "number" ? published.slice(0, limit) : published;
+  if (!supabase) return [];
+  let query = supabase
+    .from(TABLE)
+    .select("*")
+    .eq("is_published", true)
+    .order("published_at", { ascending: false })
+    .order("created_at", { ascending: false });
+  if (typeof limit === "number") query = query.limit(limit);
+  const { data, error } = await query;
+  if (error || !data) return [];
+  return (data as NewsRow[]).map(rowToItem);
 }
 
 export async function getNewsById(id: string): Promise<NewsItem | null> {
-  const items = await readAll();
-  return items.find((n) => n.id === id) ?? null;
+  // 管理画面の編集でも使うため、下書きも取得できる admin クライアントを優先
+  const client = getSupabaseAdmin() ?? supabase;
+  if (!client) return null;
+  const { data, error } = await client
+    .from(TABLE)
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+  if (error || !data) return null;
+  return rowToItem(data as NewsRow);
 }
 
 export async function createNews(input: NewsInput): Promise<NewsItem> {
-  const items = await readAll();
-  const now = new Date().toISOString();
-  const item: NewsItem = {
-    id: randomUUID(),
-    ...input,
-    createdAt: now,
-    updatedAt: now,
-  };
-  items.push(item);
-  await writeAll(items);
-  return item;
+  const admin = getSupabaseAdmin();
+  if (!admin) {
+    throw new Error(
+      "Supabase の書き込み設定（SUPABASE_SERVICE_ROLE_KEY）がありません。",
+    );
+  }
+  const { data, error } = await admin
+    .from(TABLE)
+    .insert(inputToRow(input))
+    .select("*")
+    .single();
+  if (error || !data) {
+    throw new Error(error?.message ?? "お知らせの作成に失敗しました。");
+  }
+  return rowToItem(data as NewsRow);
 }
 
 export async function updateNews(
   id: string,
   input: NewsInput,
 ): Promise<NewsItem | null> {
-  const items = await readAll();
-  const index = items.findIndex((n) => n.id === id);
-  if (index === -1) return null;
-  const updated: NewsItem = {
-    ...items[index],
-    ...input,
-    updatedAt: new Date().toISOString(),
-  };
-  items[index] = updated;
-  await writeAll(items);
-  return updated;
+  const admin = getSupabaseAdmin();
+  if (!admin) {
+    throw new Error(
+      "Supabase の書き込み設定（SUPABASE_SERVICE_ROLE_KEY）がありません。",
+    );
+  }
+  const { data, error } = await admin
+    .from(TABLE)
+    .update({ ...inputToRow(input), updated_at: new Date().toISOString() })
+    .eq("id", id)
+    .select("*")
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  if (!data) return null;
+  return rowToItem(data as NewsRow);
 }
 
 export async function deleteNews(id: string): Promise<boolean> {
-  const items = await readAll();
-  const next = items.filter((n) => n.id !== id);
-  if (next.length === items.length) return false;
-  await writeAll(next);
-  return true;
+  const admin = getSupabaseAdmin();
+  if (!admin) {
+    throw new Error(
+      "Supabase の書き込み設定（SUPABASE_SERVICE_ROLE_KEY）がありません。",
+    );
+  }
+  const { data, error } = await admin
+    .from(TABLE)
+    .delete()
+    .eq("id", id)
+    .select("id");
+  if (error) throw new Error(error.message);
+  return Array.isArray(data) && data.length > 0;
 }
 
 /** 入力値を検証して NewsInput に整形。エラーがあればメッセージ配列を返す */
